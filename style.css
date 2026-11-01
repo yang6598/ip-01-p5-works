@@ -1,0 +1,66 @@
+/* ================================================================
+   style.css —— 全站共用基础样式
+   核心职责：清掉默认边距与小片跳动，让画布严丝合缝铺满窗口，
+             从而保证"打开不出现滚动条、不错位"。
+   ================================================================ */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;          /* 关掉滚动条：画布永远和窗口一样大 */
+  background: #060A18;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* p5 生成的 canvas 默认是行内元素，会多出几像素基线空隙 → 改成块级 */
+canvas {
+  display: block;
+}
+
+/* 作品页角落的返回入口：安静，不抢画面 */
+.corner-link {
+  position: fixed;
+  left: 26px;
+  bottom: 22px;
+  z-index: 20;
+  font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  color: rgba(240, 216, 168, 0.38);
+  text-decoration: none;
+  transition: color 0.35s ease;
+}
+
+.corner-link:hover {
+  color: rgba(240, 216, 168, 0.95);
+}
+
+/* 动态页底部的操作提示：告诉观看者可以做什么 */
+.hint-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 20;
+  font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: rgba(138, 230, 192, 0.45);
+  white-space: nowrap;
+  pointer-events: none;      /* 不挡住画布上的点击交互 */
+  user-select: none;
+}
+
+.hint-bar span {
+  color: rgba(240, 216, 168, 0.85);
+  margin-right: 5px;
+}
+
+.hint-bar i {
+  font-style: normal;
+  margin: 0 9px;
+  color: rgba(138, 230, 192, 0.25);
+}

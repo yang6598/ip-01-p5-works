@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>光圈 · 动态 | Iris</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="corner-link" href="index.html">← 索引</a>
+
+  <div class="hint-bar">
+    <span>移动鼠标</span>牵引光圈
+    <i>·</i>
+    <span>点击</span>激起涟漪
+    <i>·</i>
+    <span>1 / 2 / 3</span>切换配色
+    <i>·</i>
+    <span>S</span>保存截图
+  </div>
+
+  <script src="p5.min.js"></script>
+  <script>
+  /* ================================================================
+     《光圈 · 动态》 Iris — Interactive
+     ----------------------------------------------------------------
+     与 static.html 同一套视觉语言（同心圆弧构成的光圈）：
+     不同的是这里的圆弧会随 draw() 循环持续运动，并接入三种交互。
+
+       1. 鼠标移动 —— 光圈整体被光标牵引（缓动跟随，不硬跳），
+                      弧的缺口也随之偏转
+       2. 鼠标点击 —— 从落点激起一圈涟漪，向外扩散并把经过的弧推开
+       3. 键盘 1/2/3 —— 切换三套配色（插值过渡，不硬切）
+       另有 S 键保存当前画面。
+
+     运动控制：所有变化都走 lerp / 正弦缓动，速度压得很低，
+     所以画面只会缓慢"呼吸"，不会闪、不会抖。
+     ================================================================ */
+
+  /* ---------- 1. 三套配色（每套 5 色，都满足"不超过 5 色"） ---------- */
+  const PALETTES = [
+    { name: '青光', night: '#050810', deep: '#12305A', teal: '#2FBFA0', mint: '#8AE6C0', cream: '#F0D8A8' },
+    { name: '紫光', night: '#07060F', deep: '#241B4A', teal: '#6C4CE0', mint: '#B58CFF', cream: '#FFD9E8' },
+    { name: '焰光', night: '#090604', deep: '#3B1C16', teal: '#E0652B', mint: '#F2A65A', cream: '#FFE9C7' }
+  ];
+
+  /* ---------- 2. 构图与运动参数 ---------- */
+  const RING_COUNT  = 24;      // 同心弧的道数
+  const BLADE_COUNT = 84;      // 放射细线数量
+  const GRAIN_COUNT = 3600;    // 胶片颗粒
+  const CREAM_INDEX = 17;      // 暖色弧的序号
+
+  const FOCUS_X = 0.40;        // 圆心的基准横向位置
+  const FOCUS_Y = 0.52;
+  const DRIFT_X = 0.055;       // 圆心逐环偏移 → 隧道纵深
+  const DRIFT_Y = -0.030;
+
+  const ROTATE_SPEED = 0.085;  // 弧的旋转速度（弧度/秒），很慢才不躁
+  const BREATH_SPEED = 0.55;   // 呼吸速度
+  const FOLLOW_EASE  = 0.045;  // 圆心跟随光标的缓动系数（越小越"重"）
+  const PALETTE_FADE = 0.020;  // 配色过渡速度
+  const RIPPLE_LIFE  = 4200;   // 涟漪寿命（毫秒）
+  const RIPPLE_SPEED = 430;    // 涟漪扩散速度（像素/秒）
+  const RIPPLE_BAND  = 70;     // 涟漪影响弧线的宽度
+  const MAX_RIPPLES  = 3;
+
+  let unit = 1;
+  let grainLayer;                       // 颗粒层：预渲染一次，避免每帧重画
+  let anchor;                           // 圆心的基准位置（不含光标牵引）
+  let focusPoint;                       // 实际圆心（被光标牵引后）
+  let ripples = [];                     // 活跃的涟漪
+  let palFrom = PALETTES[0];
+  let palTo   = PALETTES[0];
+  let palMix  = 1;
+  let palIndex = 0;
+  let hasMouseMoved = false;
+
+  /* ---------- 3. 初始化 ---------- */
+  function setup() {
+    const canvas = createCanvas(windowWidth, windowHeight);
+    canvas.style('display', 'block');
+    pixelDensity(1);                    // 固定 1 倍，保证不同设备帧率一致
+    noiseDetail(4, 0.55);
+    unit = Math.min(width, height) / 900;
+
+    anchor = createVector(width * FOCUS_X, height * FOCUS_Y);
+    focusPoint = anchor.copy();
+    buildGrainLayer();
+  }
+
+  function buildGrainLayer() {
+    grainLayer = createGraphics(width, height);
+    grainLayer.noStroke();
+    randomSeed(7);
+    for (let i = 0; i < GRAIN_COUNT; i++) {
+      grainLayer.fill(255, 245, 226, random(3, 10));
+      const s = random(1.0, 2.0);
+      grainLayer.rect(random(width), random(height), s, s);
+    }
+  }
+
+  /* ---------- 4. 每帧绘制 ---------- */
+  function draw() {
+    const time = millis() / 1000;
+    const pal = paletteAt(palMix);
+    if (palMix < 1) palMix = Math.min(1, palMix + PALETTE_FADE);
+
+    updateFocus();                      // 交互 1：圆心缓动跟随光标
+    cleanupRipples();
+
+    background(pal.night);
+    drawGround(pal);
+    drawRings(pal, time);               // 弧 + 辉光
+    drawBlades(pal, time);
+    drawRipples(pal);
+    drawCore(pal, time);
+    drawVignette(pal);
+    if (grainLayer) image(grainLayer, 0, 0);
+  }
+
+  /* ---------- 5. 单道弧的几何参数 ---------- */
+  function ringParams(i, pal, time) {
+    const t = i / (RING_COUNT - 1);                 // 0..1：从内到外
+    const maxRadius = Math.min(width, height) * 0.86;
+
+    // 半径：越往外越稀疏；再叠一层极轻的"呼吸"
+    let radius = maxRadius * 0.05 + maxRadius * Math.pow(t, 1.22) *
+                 (1 + (noise(i * 3.7, 1.5) - 0.5) * 0.05);
+    radius *= 1 + 0.012 * Math.sin(time * BREATH_SPEED + i * 0.45);
+
+    // 涟漪经过时把弧推开（交互 2 的视觉反馈）
+    radius += ripplePush(radius, i);
+
+    // 线宽：中段最粗、内外两端收细 → 形成节奏
+    const weight = (0.6 + 9.0 * Math.pow(Math.sin(Math.PI * Math.pow(t, 0.9)), 1.4)) * unit;
+
+    let alpha = 16 + 96 * Math.sin(Math.PI * Math.pow(t, 0.8));
+
+    // 配色：外圈冷 → 中圈主色 → 内圈高光，其中一道固定为暖色
+    let c;
+    if (i === CREAM_INDEX) {
+      c = pal.cream;
+      alpha = Math.min(255, alpha * 1.5);
+    } else if (t < 0.5) {
+      c = lerpColor(pal.deep, pal.teal, t / 0.5);
+    } else {
+      c = lerpColor(pal.teal, pal.mint, (t - 0.5) / 0.5);
+    }
+
+    // 缺口：每道弧的起止角不同；随时间缓慢偏转（越靠外转得越快）
+    const start = noise(i * 5.3, 8.1) * TWO_PI + time * ROTATE_SPEED * (0.4 + t);
+    const sweep = TWO_PI * (0.50 + 0.50 * noise(i * 2.1, 4.4)) *
+                  (0.94 + 0.06 * Math.sin(time * BREATH_SPEED * 0.8 + i * 0.7));
+
+    return {
+      cx: focusPoint.x + Math.pow(t, 1.6) * width * DRIFT_X,
+      cy: focusPoint.y + Math.pow(t, 1.6) * height * DRIFT_Y,
+      radius: radius,
+      weight: weight,
+      alpha: alpha,
+      color: c,
+      start: start,
+      sweep: sweep
+    };
+  }
+
+  /* ---------- 6. 弧与辉光 ---------- */
+  function drawRings(pal, time) {
+    // 6.1 辉光：用几道加粗、极淡的同形弧堆出来，比实时模糊便宜得多
+    blendMode(ADD);
+    noFill();
+    strokeCap(ROUND);
+    for (let i = 0; i < RING_COUNT; i++) {
+      const r = ringParams(i, pal, time);
+      const c = r.color;
+      stroke(red(c), green(c), blue(c), r.alpha * 0.055);
+      strokeWeight(r.weight * 8);
+      arc(r.cx, r.cy, r.radius * 2, r.radius * 2, r.start, r.start + r.sweep);
+      stroke(red(c), green(c), blue(c), r.alpha * 0.10);
+      strokeWeight(r.weight * 3.2);
+      arc(r.cx, r.cy, r.radius * 2, r.radius * 2, r.start, r.start + r.sweep);
+    }
+    blendMode(BLEND);
+
+    // 6.2 清晰的弧身
+    push();
+    noFill();
+    strokeCap(ROUND);
+    for (let i = 0; i < RING_COUNT; i++) {
+      const r = ringParams(i, pal, time);
+      stroke(red(r.color), green(r.color), blue(r.color), r.alpha);
+      strokeWeight(r.weight);
+      arc(r.cx, r.cy, r.radius * 2, r.radius * 2, r.start, r.start + r.sweep);
+
+      // 弧头收笔：两端各点一个小圆，收得干净
+      noStroke();
+      fill(red(r.color), green(r.color), blue(r.color), r.alpha * 0.95);
+      for (const a of [r.start, r.start + r.sweep]) {
+        circle(r.cx + Math.cos(a) * r.radius, r.cy + Math.sin(a) * r.radius, r.weight * 0.92);
+      }
+      noFill();
+    }
+    pop();
+  }
+
+  /* ---------- 7. 放射细线 ---------- */
+  function drawBlades(pal, time) {
+    const maxRadius = Math.min(width, height) * 0.86;
+    blendMode(ADD);
+    strokeWeight(1 * unit);
+    for (let i = 0; i < BLADE_COUNT; i++) {
+      const a = -1.10 + (i / BLADE_COUNT) * 1.95 +
+                (noise(i * 0.9, 2.2) - 0.5) * 0.02 +
+                time * 0.02;                       // 极慢地扫过，几乎察觉不到
+      const inner = maxRadius * (0.08 + 0.05 * noise(i * 1.7, 6.3));
+      const outer = maxRadius * (0.45 + 0.50 * noise(i * 2.3, 9.1));
+      const alpha = 5 + 22 * noise(i * 1.3, 3.7);
+
+      stroke(red(pal.mint), green(pal.mint), blue(pal.mint), alpha);
+      line(focusPoint.x + Math.cos(a) * inner, focusPoint.y + Math.sin(a) * inner,
+           focusPoint.x + Math.cos(a) * outer, focusPoint.y + Math.sin(a) * outer);
+    }
+    blendMode(BLEND);
+  }
+
+  /* ---------- 8. 涟漪（交互 2 的可见反馈） ---------- */
+  function drawRipples(pal) {
+    const ctx = drawingContext;
+    ctx.globalCompositeOperation = 'lighter';
+    noFill();
+    for (const ripple of ripples) {
+      const age = (millis() - ripple.born) / 1000;
+      const progress = age / (RIPPLE_LIFE / 1000);
+      if (progress >= 1) continue;
+
+      const radius = age * RIPPLE_SPEED;
+      const fade = 1 - progress;
+      stroke(red(pal.cream), green(pal.cream), blue(pal.cream), 52 * fade);
+      strokeWeight(1.3 * unit);
+      circle(ripple.x, ripple.y, radius * 2);
+      stroke(red(pal.mint), green(pal.mint), blue(pal.mint), 24 * fade);
+      strokeWeight(4.0 * unit);
+      circle(ripple.x, ripple.y, radius * 1.94);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* 某道弧被涟漪推开的位移量 */
+  function ripplePush(ringRadius, ringIndex) {
+    if (ripples.length === 0) return 0;
+
+    let push = 0;
+    const now = millis();
+    for (const ripple of ripples) {
+      const age = (now - ripple.born) / 1000;
+      if (age > RIPPLE_LIFE / 1000) continue;
+
+      // 涟漪在当前弧附近时，弧被向外顶起
+      const waveRadius = age * RIPPLE_SPEED;
+      const distance = Math.abs(ringRadius - waveRadius);
+      if (distance > RIPPLE_BAND) continue;
+
+      const bandT = 1 - distance / RIPPLE_BAND;
+      const lifeFade = 1 - age / (RIPPLE_LIFE / 1000);
+      push += bandT * bandT * lifeFade * 26 * unit * (1 + ringIndex * 0.02);
+    }
+    return push;
+  }
+
+  /* ---------- 9. 底色与光核 ---------- */
+  function drawGround(pal) {
+    const ctx = drawingContext;
+    const g = ctx.createRadialGradient(
+      focusPoint.x, focusPoint.y, 0,
+      focusPoint.x, focusPoint.y, Math.max(width, height) * 0.78
+    );
+    g.addColorStop(0.00, rgbaOf(pal.deep, 0.50));
+    g.addColorStop(0.35, rgbaOf(pal.deep, 0.22));
+    g.addColorStop(1.00, rgbaOf(pal.night, 0.00));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  function drawCore(pal, time) {
+    const ctx = drawingContext;
+    const pulse = 1 + 0.06 * Math.sin(time * BREATH_SPEED);   // 极轻的搏动
+    const r = Math.min(width, height) * 0.20 * pulse;
+
+    ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(focusPoint.x, focusPoint.y, 0, focusPoint.x, focusPoint.y, r);
+    g.addColorStop(0.00, 'rgba(255, 250, 236,' + (0.80 * pulse - 0.10) + ')');
+    g.addColorStop(0.14, rgbaOf(pal.cream, 0.34));
+    g.addColorStop(0.48, rgbaOf(pal.mint, 0.10));
+    g.addColorStop(1.00, rgbaOf(pal.teal, 0.00));
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(focusPoint.x, focusPoint.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function drawVignette(pal) {
+    const ctx = drawingContext;
+    const inner = Math.min(width, height) * 0.30;
+    const outer = Math.max(width, height) * 0.92;
+    const vignette = ctx.createRadialGradient(
+      width * FOCUS_X, height * FOCUS_Y, inner,
+      width * FOCUS_X, height * FOCUS_Y, outer
+    );
+    vignette.addColorStop(0, rgbaOf(pal.night, 0));
+    vignette.addColorStop(1, rgbaOf(pal.night, 0.72));
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  /* ---------- 10. 交互 ---------- */
+  function mouseMoved() {
+    hasMouseMoved = true;
+  }
+
+  function mousePressed() {
+    hasMouseMoved = true;
+    ripples.push({ x: mouseX, y: mouseY, born: millis() });
+    if (ripples.length > MAX_RIPPLES) ripples.shift();
+  }
+
+  function keyPressed() {
+    if (key === '1') setPalette(0);
+    if (key === '2') setPalette(1);
+    if (key === '3') setPalette(2);
+    if (key === 's' || key === 'S') saveCanvas('iris-' + palTo.name, 'png');
+  }
+
+  function setPalette(index) {
+    if (index === palIndex) return;
+    palFrom = paletteAt(palMix);      // 从当前颜色开始过渡，中途切换也不跳
+    palTo = PALETTES[index];
+    palIndex = index;
+    palMix = 0;
+  }
+
+  /* 交互 1：圆心朝光标缓慢偏移，产生"光圈被牵引"的手感 */
+  function updateFocus() {
+    if (!hasMouseMoved) return;
+    const targetX = width * FOCUS_X + (mouseX - width * 0.5) * 0.10;
+    const targetY = height * FOCUS_Y + (mouseY - height * 0.5) * 0.10;
+    focusPoint.x = lerp(focusPoint.x, targetX, FOLLOW_EASE);
+    focusPoint.y = lerp(focusPoint.y, targetY, FOLLOW_EASE);
+  }
+
+  function cleanupRipples() {
+    const now = millis();
+    ripples = ripples.filter(r => now - r.born < RIPPLE_LIFE);
+  }
+
+  /* ---------- 11. 工具 ---------- */
+  function paletteAt(mix) {
+    return {
+      night: lerpColor(color(palFrom.night), color(palTo.night), mix),
+      deep:  lerpColor(color(palFrom.deep),  color(palTo.deep),  mix),
+      teal:  lerpColor(color(palFrom.teal),  color(palTo.teal),  mix),
+      mint:  lerpColor(color(palFrom.mint),  color(palTo.mint),  mix),
+      cream: lerpColor(color(palFrom.cream), color(palTo.cream), mix)
+    };
+  }
+
+  function rgbaOf(c, alpha) {
+    return 'rgba(' + Math.round(red(c)) + ',' + Math.round(green(c)) + ',' +
+           Math.round(blue(c)) + ',' + alpha + ')';
+  }
+
+  /* ---------- 12. 窗口缩放 ---------- */
+  function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+    unit = Math.min(width, height) / 900;
+    anchor = createVector(width * FOCUS_X, height * FOCUS_Y);
+    buildGrainLayer();
+  }
+  </script>
+</body>
+</html>
